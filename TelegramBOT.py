@@ -13,8 +13,12 @@ bot = telebot.TeleBot(TOKEN)
 
 # Словари для хранения состояния пользователя
 user_states = {}
-user_profession_matches = {}  # Для сохранения найденных профессий
-professions_df = None  # Кэш для DataFrame профессий
+user_profession_matches = {}
+user_selected_profession = {}
+user_selected_hazards = {}
+user_hazard_matches = {}
+professions_df = None
+hazards_df = None
 
 
 def load_professions_df():
@@ -27,6 +31,18 @@ def load_professions_df():
             print(f"Ошибка при загрузке профессий: {e}")
             return None
     return professions_df
+
+
+def load_hazards_df():
+    """Загружает DataFrame опасностей один раз"""
+    global hazards_df
+    if hazards_df is None:
+        try:
+            hazards_df = pd.read_excel('iden_haz.xlsx', header=None)
+        except Exception as e:
+            print(f"Ошибка при загрузке опасностей: {e}")
+            return None
+    return hazards_df
 
 
 def parse_norm_string(norm_str):
@@ -117,18 +133,94 @@ def find_professions_by_name(professions_df, search_name, limit=10):
                         'idx': idx
                     })
 
-                # Ограничиваем результаты
                 if len(matches) >= limit:
                     break
 
     return matches
 
 
-def extract_siz_data(professions_df, profession_code, start_idx):
-    """Извлекает данные о СИЗ для конкретной профессии"""
-    profession_name = professions_df.iloc[start_idx, 1]
-    siz_list = []
+def find_hazards_by_keyword(hazards_df, keyword):
+    """Ищет опасности по ключевому слову в столбце A (индекс 0)"""
+    keyword_lower = keyword.lower().strip()
+    matches = []
+    seen_hazards = set()
 
+    for idx, row in hazards_df.iterrows():
+        hazard_name = row.iloc[0]
+
+        if pd.notna(hazard_name):
+            hazard_name_str = str(hazard_name).strip()
+            if keyword_lower in hazard_name_str.lower() and hazard_name_str not in seen_hazards:
+                matches.append({
+                    'name': hazard_name_str,
+                    'idx': idx
+                })
+                seen_hazards.add(hazard_name_str)
+
+    return matches
+
+
+def extract_siz_from_hazard(hazards_df, hazard_idx):
+    """Извлекает СИЗ из строки опасности в файле iden_haz.xlsx
+
+    Структура файла:
+    Столбец A (0) - Название опасности
+    Столбец C (2) - Тип/группа СИЗ
+    Столбец D (3) - Конструкция СИЗ (наименование)
+    Столбец E (4) - Нормы выдачи
+    """
+    siz_list = []
+    row = hazards_df.iloc[hazard_idx]
+
+    # Начинаем со следующей строки и собираем связанные СИЗ
+    # пока не встретим новую опасность (новую заполненную ячейку в столбце A)
+    idx = hazard_idx + 1
+
+    while idx < len(hazards_df):
+        current_row = hazards_df.iloc[idx]
+
+        # Если встретили новую опасность в столбце A, останавливаемся
+        if pd.notna(current_row.iloc[0]) and str(current_row.iloc[0]).strip():
+            # Проверяем, это ли опасность (начинается ли строка с нового номера)
+            if current_row.iloc[0] != "или":
+                break
+
+        # Извлекаем наименование СИЗ из столбца D (индекс 3)
+        siz_name = current_row.iloc[3] if len(current_row) > 3 else None
+
+        # Извлекаем норму выдачи из столбца E (индекс 4)
+        norm_str = current_row.iloc[4] if len(current_row) > 4 else None
+
+        if pd.notna(siz_name) and str(siz_name).strip():
+            siz_name_str = str(siz_name).strip()
+
+            # Пропускаем служебные строки
+            if siz_name_str.lower() not in ['или', 'и/или', 'in', 'or']:
+                quantity, unit = parse_norm_string(norm_str)
+                years_info = extract_years_info(norm_str)
+
+                if quantity:
+                    quantity_str = f"{quantity}{years_info}"
+                else:
+                    quantity_str = str(norm_str) if pd.notna(norm_str) and str(norm_str).strip() else "до износа"
+
+                siz_list.append({
+                    'name': siz_name_str,
+                    'unit': unit if unit else 'штуки',
+                    'quantity': quantity_str,
+                    'norm': '№767н'
+                })
+
+        idx += 1
+
+    return siz_list
+
+
+def extract_siz_data(professions_df, profession_code, start_idx, hazards_list=None):
+    """Извлекает данные о СИЗ для конкретной профессии и опасностей"""
+    siz_dict = {}
+
+    # Извлекаем СИЗ из профессии
     for idx in range(start_idx + 1, len(professions_df)):
         row = professions_df.iloc[idx]
 
@@ -145,16 +237,44 @@ def extract_siz_data(professions_df, profession_code, start_idx):
             if quantity:
                 quantity_str = f"{quantity}{years_info}"
             else:
-                quantity_str = str(norm_str) if norm_str else "до износа"
+                quantity_str = str(norm_str) if pd.notna(norm_str) else "до износа"
 
-            siz_list.append({
-                'name': str(siz_name).strip(),
-                'unit': unit if unit else 'штуки',
-                'quantity': quantity_str,
-                'norm': '№767н'
-            })
+            siz_name_str = str(siz_name).strip()
 
-    return siz_list
+            if siz_name_str not in siz_dict:
+                siz_dict[siz_name_str] = {
+                    'name': siz_name_str,
+                    'unit': unit if unit else 'штуки',
+                    'quantity': quantity_str,
+                    'norm': '№767н'
+                }
+
+    # Извлекаем СИЗ из опасностей
+    if hazards_list:
+        hazards_df = load_hazards_df()
+
+        for hazard_name in hazards_list:
+            # Ищем строку с этой опасностью
+            for idx, row in hazards_df.iterrows():
+                current_hazard = row.iloc[0]
+                if pd.notna(current_hazard):
+                    current_hazard_str = str(current_hazard).strip()
+                    if current_hazard_str == hazard_name:
+                        # Нашли опасность, извлекаем связанные СИЗ
+                        hazard_siz_list = extract_siz_from_hazard(hazards_df, idx)
+
+                        for siz in hazard_siz_list:
+                            if siz['name'] not in siz_dict:
+                                siz_dict[siz['name']] = siz
+                            else:
+                                # Если СИЗ уже есть, обновляем количество
+                                existing = siz_dict[siz['name']]
+                                # Объединяем количества через запятую если они разные
+                                if existing['quantity'] != siz['quantity']:
+                                    existing['quantity'] = f"{existing['quantity']}, {siz['quantity']}"
+                        break
+
+    return list(siz_dict.values())
 
 
 def set_cell_border(cell, **kwargs):
@@ -232,14 +352,14 @@ def fill_siz_table(doc, siz_data):
     return True
 
 
-def generate_siz_document_from_match(match):
-    """Генерирует документ из объекта профессии (match)"""
+def generate_siz_document_from_match(match, hazards_list=None):
+    """Генерирует документ из объекта профессии"""
     try:
         professions_df = load_professions_df()
         if professions_df is None:
             return None, "Ошибка при загрузке файла профессий"
 
-        siz_data = extract_siz_data(professions_df, match['code'], match['idx'])
+        siz_data = extract_siz_data(professions_df, match['code'], match['idx'], hazards_list)
 
         if not siz_data:
             return None, f"❌ Не найдены СИЗ для профессии '{match['name']}'"
@@ -346,97 +466,45 @@ def process_profession_input(message):
     if not profession_query or len(profession_query) < 2:
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         markup.add(telebot.types.KeyboardButton("◀️ Назад"))
-        msg = bot.send_message(chat_id, "❌ Введите минимум 2 символа для поиска\n\nПопробуйте еще раз:", reply_markup=markup)
+        msg = bot.send_message(chat_id, "❌ Введите минимум 2 символа для поиска\n\nПопробуйте еще раз:",
+                               reply_markup=markup)
         bot.register_next_step_handler(msg, process_profession_input)
         return
 
-    # Загружаем профессии
     professions_df = load_professions_df()
     if professions_df is None:
         bot.send_message(chat_id, "❌ Ошибка при загрузке файла профессий")
         user_states.pop(chat_id, None)
         return
 
-    # Сначала ищем по коду
     code, profession_name, start_idx = find_profession_by_code(professions_df, profession_query)
 
     if code is not None:
-        # Найдена профессия по коду
-        match = {
+        selected_profession = {
             'code': code,
             'name': profession_name,
             'idx': start_idx
         }
-
-        processing_msg = bot.send_message(chat_id, f"⏳ Генерирую документ для профессии: {profession_name}...")
-
-        doc_output, error = generate_siz_document_from_match(match)
-
-        if error:
-            bot.edit_message_text(error, chat_id, processing_msg.message_id)
-            user_states.pop(chat_id, None)
-            return
-
-        try:
-            bot.delete_message(chat_id, processing_msg.message_id)
-        except:
-            pass
-
-        doc_output.name = f"СИЗ_{profession_name}.docx"
-        bot.send_document(chat_id, doc_output, caption=f"✅ Документ для профессии:\n{profession_name} (№ {code})")
-
-        user_states.pop(chat_id, None)
-        user_profession_matches.pop(chat_id, None)
-
-        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add(telebot.types.KeyboardButton("📋 Расчет СИЗ"))
-        markup.add(telebot.types.KeyboardButton("🏠 В главное меню"))
-
-        bot.send_message(chat_id, "Готово! Что дальше?", reply_markup=markup)
+        user_selected_profession[chat_id] = selected_profession
+        ask_for_additional_hazards(message, selected_profession)
         return
 
-    # Ищем по названию
     matches = find_professions_by_name(professions_df, profession_query, limit=10)
 
     if not matches:
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         markup.add(telebot.types.KeyboardButton("◀️ Назад"))
-        msg = bot.send_message(chat_id, f"❌ Профессия '{profession_query}' не найдена\n\nПопробуйте еще раз с другим названием:", reply_markup=markup)
+        msg = bot.send_message(chat_id,
+                               f"❌ Профессия '{profession_query}' не найдена\n\nПопробуйте еще раз с другим названием:",
+                               reply_markup=markup)
         bot.register_next_step_handler(msg, process_profession_input)
         return
 
     if len(matches) == 1:
-        # Найдена одна профессия - генерируем документ сразу
-        match = matches[0]
-
-        processing_msg = bot.send_message(chat_id, f"⏳ Генерирую документ для профессии: {match['name']}...")
-
-        doc_output, error = generate_siz_document_from_match(match)
-
-        if error:
-            bot.edit_message_text(error, chat_id, processing_msg.message_id)
-            user_states.pop(chat_id, None)
-            return
-
-        try:
-            bot.delete_message(chat_id, processing_msg.message_id)
-        except:
-            pass
-
-        doc_output.name = f"СИЗ_{match['name']}.docx"
-        bot.send_document(chat_id, doc_output, caption=f"✅ Документ для профессии:\n{match['name']} (№ {match['code']})")
-
-        user_states.pop(chat_id, None)
-        user_profession_matches.pop(chat_id, None)
-
-        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add(telebot.types.KeyboardButton("📋 Расчет СИЗ"))
-        markup.add(telebot.types.KeyboardButton("🏠 В главное меню"))
-
-        bot.send_message(chat_id, "Готово! Что дальше?", reply_markup=markup)
+        user_selected_profession[chat_id] = matches[0]
+        ask_for_additional_hazards(message, matches[0])
         return
 
-    # Найдено несколько профессий - показываем список для выбора
     user_profession_matches[chat_id] = matches
     user_states[chat_id] = "waiting_profession_choice"
 
@@ -475,7 +543,6 @@ def process_profession_choice(message):
 
     choice_text = message.text.strip()
 
-    # Проверяем, что пользователь ввел число
     try:
         choice_num = int(choice_text)
     except ValueError:
@@ -493,7 +560,6 @@ def process_profession_choice(message):
 
     matches = user_profession_matches.get(chat_id, [])
 
-    # Проверяем, что номер в допустимом диапазоне
     if choice_num < 1 or choice_num > len(matches):
         markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
 
@@ -506,19 +572,274 @@ def process_profession_choice(message):
         bot.register_next_step_handler(msg, process_profession_choice)
         return
 
-    # Получаем выбранную профессию
     selected_profession = matches[choice_num - 1]
+    user_selected_profession[chat_id] = selected_profession
+    ask_for_additional_hazards(message, selected_profession)
 
-    # Отправляем сообщение о генерации
-    processing_msg = bot.send_message(chat_id, f"⏳ Генерирую документ для профессии: {selected_profession['name']}...")
 
-    # Генерируем документ
-    doc_output, error = generate_siz_document_from_match(selected_profession)
+def ask_for_additional_hazards(message, profession):
+    """Спрашивает пользователя о дополнительных опасностях"""
+    chat_id = message.chat.id
+    user_states[chat_id] = "waiting_additional_hazards"
+    user_selected_hazards[chat_id] = []
+
+    ask_text = f"""✅ Выбрана профессия: {profession['name']} (№ {profession['code']})
+
+❓ Есть ли еще дополнительные условия (идентифицированные опасности)?"""
+
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("Да"), telebot.types.KeyboardButton("Нет"))
+    markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+    msg = bot.send_message(chat_id, ask_text, reply_markup=markup)
+    bot.register_next_step_handler(msg, process_hazard_question)
+
+
+def process_hazard_question(message):
+    """Обрабатывает ответ на вопрос об опасностях"""
+    chat_id = message.chat.id
+
+    if message.text == "◀️ Назад":
+        user_states[chat_id] = "waiting_profession"
+        user_selected_profession.pop(chat_id, None)
+        user_selected_hazards.pop(chat_id, None)
+
+        request_text = """🔍 Введи название или код профессии:"""
+
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, request_text, reply_markup=markup)
+        bot.register_next_step_handler(msg, process_profession_input)
+        return
+
+    if message.text == "Да":
+        user_states[chat_id] = "waiting_hazard_keyword"
+
+        hazard_text = """🔍 Введи ключевое слово опасности:
+
+Примеры:
+• Шум
+• Вибрация
+• Электрический ток
+• Пыль
+• Высокая температура"""
+
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, hazard_text, reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    if message.text == "Нет":
+        generate_final_document(message, chat_id)
+        return
+
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("Да"), telebot.types.KeyboardButton("Нет"))
+    markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+    msg = bot.send_message(chat_id, "❌ Выберите 'Да' или 'Нет':", reply_markup=markup)
+    bot.register_next_step_handler(msg, process_hazard_question)
+
+
+def process_hazard_keyword(message):
+    """Обрабатывает ввод ключевого слова опасности"""
+    chat_id = message.chat.id
+
+    if message.text == "◀️ Назад":
+        profession = user_selected_profession.get(chat_id)
+        ask_for_additional_hazards(message, profession)
+        return
+
+    if message.text == "Готово":
+        generate_final_document(message, chat_id)
+        return
+
+    keyword = message.text.strip()
+
+    if not keyword or len(keyword) < 2:
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+        msg = bot.send_message(chat_id, "❌ Введите минимум 2 символа\n\nПопробуйте еще раз:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    hazards_df = load_hazards_df()
+    if hazards_df is None:
+        bot.send_message(chat_id, "❌ Ошибка при загрузке файла опасностей")
+        return
+
+    matches = find_hazards_by_keyword(hazards_df, keyword)
+
+    if not matches:
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+        msg = bot.send_message(chat_id, f"❌ Опасности по запросу '{keyword}' не найдены\n\nПопробуйте еще раз:",
+                               reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    user_hazard_matches[chat_id] = matches
+    user_states[chat_id] = "waiting_hazard_choice"
+
+    message_text = f"🔍 Найдено опасностей по запросу '{keyword}':\n\n"
+
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+    for i, match in enumerate(matches, 1):
+        message_text += f"{i}. {match['name']}\n"
+        markup.add(telebot.types.KeyboardButton(str(i)))
+
+    message_text += "\n👇 Выбери номер нужной опасности (можно несколько раз выбирать разные):"
+
+    markup.add(telebot.types.KeyboardButton("Готово"))
+    markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+    msg = bot.send_message(chat_id, message_text, reply_markup=markup)
+    bot.register_next_step_handler(msg, process_hazard_choice)
+
+
+def process_hazard_choice(message):
+    """Обрабатывает выбор опасности"""
+    chat_id = message.chat.id
+
+    if message.text == "◀️ Назад":
+        user_states[chat_id] = "waiting_hazard_keyword"
+        user_hazard_matches.pop(chat_id, None)
+
+        hazard_text = """🔍 Введи ключевое слово опасности:"""
+
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, hazard_text, reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    if message.text == "Готово":
+        # Проверяем, выбраны ли опасности, если нет - снова спрашиваем
+        profession = user_selected_profession.get(chat_id)
+        ask_for_additional_hazards(message, profession)
+        return
+
+    choice_text = message.text.strip()
+
+    try:
+        choice_num = int(choice_text)
+    except ValueError:
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+        matches = user_hazard_matches.get(chat_id, [])
+        for i in range(1, len(matches) + 1):
+            markup.add(telebot.types.KeyboardButton(str(i)))
+
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, "❌ Введите номер из списка:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_choice)
+        return
+
+    matches = user_hazard_matches.get(chat_id, [])
+
+    if choice_num < 1 or choice_num > len(matches):
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+        for i in range(1, len(matches) + 1):
+            markup.add(telebot.types.KeyboardButton(str(i)))
+
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, f"❌ Введите номер от 1 до {len(matches)}:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_choice)
+        return
+
+    selected_hazard = matches[choice_num - 1]
+
+    # Добавляем опасность в список выбранных
+    if selected_hazard['name'] not in user_selected_hazards[chat_id]:
+        user_selected_hazards[chat_id].append(selected_hazard['name'])
+
+    # Показываем выбранные опасности
+    selected_text = "✅ Выбранные опасности:\n"
+    for hazard in user_selected_hazards[chat_id]:
+        selected_text += f"• {hazard}\n"
+
+    selected_text += "\n❓ Есть еще опасности?"
+
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("Да"), telebot.types.KeyboardButton("Нет"))
+    markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+    msg = bot.send_message(chat_id, selected_text, reply_markup=markup)
+    bot.register_next_step_handler(msg, process_add_more_hazards)
+
+
+def process_add_more_hazards(message):
+    """Спрашивает, есть ли еще опасности"""
+    chat_id = message.chat.id
+
+    if message.text == "◀️ Назад":
+        user_states[chat_id] = "waiting_hazard_keyword"
+        user_hazard_matches.pop(chat_id, None)
+
+        hazard_text = """🔍 Введи ключевое слово опасности:"""
+
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, hazard_text, reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    if message.text == "Да":
+        user_states[chat_id] = "waiting_hazard_keyword"
+
+        hazard_text = """🔍 Введи ключевое слово опасности:"""
+
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(telebot.types.KeyboardButton("Готово"))
+        markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+
+        msg = bot.send_message(chat_id, hazard_text, reply_markup=markup)
+        bot.register_next_step_handler(msg, process_hazard_keyword)
+        return
+
+    if message.text == "Нет":
+        generate_final_document(message, chat_id)
+        return
+
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("Да"), telebot.types.KeyboardButton("Нет"))
+    markup.add(telebot.types.KeyboardButton("◀️ Назад"))
+    msg = bot.send_message(chat_id, "❌ Выберите 'Да' или 'Нет':", reply_markup=markup)
+    bot.register_next_step_handler(msg, process_add_more_hazards)
+
+
+def generate_final_document(message, chat_id):
+    """Генерирует финальный документ"""
+    profession = user_selected_profession.get(chat_id)
+    hazards_list = user_selected_hazards.get(chat_id, [])
+
+    if not profession:
+        send_welcome(message)
+        return
+
+    processing_msg = bot.send_message(chat_id, f"⏳ Генерирую документ для профессии: {profession['name']}...")
+
+    doc_output, error = generate_siz_document_from_match(profession, hazards_list if hazards_list else None)
 
     if error:
         bot.edit_message_text(error, chat_id, processing_msg.message_id)
         user_states.pop(chat_id, None)
-        user_profession_matches.pop(chat_id, None)
+        user_selected_profession.pop(chat_id, None)
+        user_selected_hazards.pop(chat_id, None)
         return
 
     try:
@@ -526,12 +847,20 @@ def process_profession_choice(message):
     except:
         pass
 
-    # Отправляем документ
-    doc_output.name = f"СИЗ_{selected_profession['name']}.docx"
-    bot.send_document(chat_id, doc_output, caption=f"✅ Документ для профессии:\n{selected_profession['name']} (№ {selected_profession['code']})")
+    doc_output.name = f"СИЗ_{profession['name']}.docx"
+
+    caption = f"✅ Документ для профессии:\n{profession['name']} (№ {profession['code']})"
+    if hazards_list:
+        caption += f"\n\nДополнительные опасности:\n"
+        for hazard in hazards_list:
+            caption += f"• {hazard}\n"
+
+    bot.send_document(chat_id, doc_output, caption=caption)
 
     user_states.pop(chat_id, None)
-    user_profession_matches.pop(chat_id, None)
+    user_selected_profession.pop(chat_id, None)
+    user_selected_hazards.pop(chat_id, None)
+    user_hazard_matches.pop(chat_id, None)
 
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(telebot.types.KeyboardButton("📋 Расчет СИЗ"))
@@ -542,8 +871,12 @@ def process_profession_choice(message):
 
 @bot.message_handler(func=lambda message: message.text == "🏠 В главное меню")
 def go_back_main(message):
-    user_states.pop(message.chat.id, None)
-    user_profession_matches.pop(message.chat.id, None)
+    chat_id = message.chat.id
+    user_states.pop(chat_id, None)
+    user_profession_matches.pop(chat_id, None)
+    user_selected_profession.pop(chat_id, None)
+    user_selected_hazards.pop(chat_id, None)
+    user_hazard_matches.pop(chat_id, None)
     send_welcome(message)
 
 
@@ -562,7 +895,7 @@ def echo_all(message):
     bot.send_message(message.chat.id, "Пожалуйста, используй кнопки меню для навигации или команду /start")
 
 
-# Загружаем профессии при запуске бота
 load_professions_df()
+load_hazards_df()
 
 bot.infinity_polling()
